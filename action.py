@@ -264,6 +264,41 @@ def find_trash_mailbox(conn):
         pass
     return None
 
+IMAP_OP_TIMEOUT = 15  # overall budget for a direct-IMAP fallback operation, seconds
+
+def _imap_delete_direct(mid):
+    """Direct-IMAP trash fallback. Runs in a child process so a hung server (Gmail
+    trickling bytes without ever completing a line) can be killed by the parent's
+    timeout — socket.timeout and SIGALRM cannot interrupt a blocking SSL read."""
+    creds = load_imap_credentials()
+    if not creds or creds[3] == "xoauth2":
+        return False
+    server, user, pw, auth_type = creds
+    host, _, port = server.partition(":")
+    try:
+        port = int(port) if port else 993
+        conn = imaplib.IMAP4_SSL(host, port, timeout=5)
+        conn.sock.settimeout(5)
+        try:
+            conn.login(user, pw)
+            typ, _ = conn.select("INBOX")
+            if typ == "OK":
+                trash = find_trash_mailbox(conn)
+                if trash:
+                    uid = mid if mid.isdigit() else resolve_uid_by_msgid(conn, mid)
+                    if uid:
+                        typ, data = conn.uid("MOVE", uid, trash)
+                        if typ == "OK":
+                            return True
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
 def delete_message(mid):
     """Move message to trash via native himalaya delete with direct IMAP fallback."""
     # 1. Native himalaya message delete — works for Gmail REST (OAuth), IMAP, JMAP, Maildir
@@ -274,33 +309,23 @@ def delete_message(mid):
     # 2. Direct IMAP fallback for accounts with plain IMAP credentials
     creds = load_imap_credentials()
     if creds and creds[3] != "xoauth2":
-        server, user, pw, auth_type = creds
-        host, _, port = server.partition(":")
         try:
-            port = int(port) if port else 993
-            conn = imaplib.IMAP4_SSL(host, port, timeout=5)
-            try:
-                conn.login(user, pw)
-                typ, _ = conn.select("INBOX")
-                if typ == "OK":
-                    trash = find_trash_mailbox(conn)
-                    if trash:
-                        uid = mid if mid.isdigit() else resolve_uid_by_msgid(conn, mid)
-                        if uid:
-                            typ, data = conn.uid("MOVE", uid, trash)
-                            if typ == "OK":
-                                return True, ""
-            finally:
-                try:
-                    conn.logout()
-                except Exception:
-                    pass
-        except Exception:
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--imap-delete", mid],
+                capture_output=True, text=True, timeout=IMAP_OP_TIMEOUT, start_new_session=True)
+            if proc.returncode == 0 and proc.stdout.strip() == "ok":
+                return True, ""
+        except subprocess.TimeoutExpired:
             pass
 
     return False, err or out or "Failed to delete message via himalaya"
 
 def main():
+    if "--imap-delete" in sys.argv:
+        idx = sys.argv.index("--imap-delete")
+        mid = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        print("ok" if _imap_delete_direct(mid) else "fail")
+        sys.exit(0)
     if len(sys.argv) < 3:
         print(json.dumps({"success": False, "error": "Usage: action.py <mark_read|mark_unread|delete> <id>"}))
         sys.exit(1)
@@ -333,7 +358,7 @@ def main():
         sys.exit(1)
 
     try:
-        out, err, code = run_himalaya_safe(cmd, timeout=12.0)
+        out, err, code = run_himalaya_safe(cmd, timeout=8.0)
         if code == 0:
             print(json.dumps({"success": True, "id": mid, "action": action}))
         else:

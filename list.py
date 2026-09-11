@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import imaplib
 import tomllib
+import threading
 
 CACHE_BASE = os.path.expanduser("~/.cache/omarmail")
 CACHE_DIR = os.path.join(CACHE_BASE, "pages")
@@ -101,6 +102,7 @@ def _imap_connect(creds):
     try: port = int(port) if port else 993
     except ValueError: port = 993
     conn = imaplib.IMAP4_SSL(host, port, timeout=8)
+    conn.sock.settimeout(8)
     if auth_type == "xoauth2":
         auth_str = f"user={user}\x01auth=Bearer {pw}\x01\x01"
         conn.authenticate("XOAUTH2", lambda _: auth_str.encode())
@@ -109,66 +111,65 @@ def _imap_connect(creds):
     conn.select("INBOX")
     return conn
 
-def fetch_excluded_msgids(terms):
-    """Resolve Message-IDs hidden by the given search terms, cached for EXCLUDED_TTL."""
-    if os.path.exists(EXCLUDED_MSGID_CACHE):
-        try:
-            fresh = time.time() - os.path.getmtime(EXCLUDED_MSGID_CACHE) < EXCLUDED_TTL
-            config_newer = (os.path.exists(EXCLUDED_CONFIG) and
-                            os.path.getmtime(EXCLUDED_CONFIG) > os.path.getmtime(EXCLUDED_MSGID_CACHE))
-            if fresh and not config_newer:
-                with open(EXCLUDED_MSGID_CACHE, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
-        except Exception:
-            pass
+IMAP_OP_TIMEOUT = 20  # overall budget for an IMAP exclusion lookup, seconds
+
+def _resolve_excluded_imap(terms):
+    """Resolve UIDs hidden by the given search terms. UID-based (not Message-ID):
+    X-GM-RAW SEARCH returns UIDs directly, while the old header-FETCH approach
+    needed ~95 batched FETCHes for this mailbox and Gmail trickle-hung on them.
+    himalaya's envelope id is the IMAP UID, so envelopes are filtered by id."""
+    uids = set()
     creds = load_imap_credentials()
     if not creds:
-        return set()
-    msgids = set()
+        return uids
     try:
         conn = _imap_connect(creds)
         try:
-            uids = set()
             for term in terms:
                 typ, data = conn.uid("SEARCH", f'X-GM-RAW "{term}"')
                 if typ == "OK" and data and data[0]:
                     uids.update(data[0].decode().split())
-            if uids:
-                uid_list = sorted(uids, key=int)
-                for i in range(0, len(uid_list), 200):
-                    batch = ",".join(uid_list[i:i+200])
-                    typ, data = conn.uid("FETCH", batch, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-                    if typ == "OK":
-                        for item in data:
-                            if isinstance(item, tuple) and len(item) > 1:
-                                for line in item[1].decode(errors="replace").splitlines():
-                                    if line.lower().startswith("message-id:"):
-                                        mid = line.split(":", 1)[1].strip().strip("<>")
-                                        if mid: msgids.add(mid)
         finally:
             try: conn.logout()
             except Exception: pass
     except Exception:
-        return set()
-    if msgids:
+        pass
+    return uids
+
+def fetch_excluded_msgids(terms):
+    """Return cached excluded UIDs immediately (fresh or stale), and refresh
+    the cache in the background. Never blocks list rendering on a hung IMAP server:
+    a Gmail trickle-hang previously cost 20s per list call and silently disabled
+    exclusion."""
+    cached = None
+    if os.path.exists(EXCLUDED_MSGID_CACHE):
         try:
-            tmp = EXCLUDED_MSGID_CACHE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(sorted(msgids), f)
-            os.replace(tmp, EXCLUDED_MSGID_CACHE)
+            with open(EXCLUDED_MSGID_CACHE, "r", encoding="utf-8") as f:
+                cached = set(json.load(f))
+            try:
+                if time.time() - os.path.getmtime(EXCLUDED_MSGID_CACHE) < EXCLUDED_TTL:
+                    return cached
+            except Exception:
+                pass
         except Exception:
-            pass
-    return msgids
+            cached = None
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--resolve-excluded", json.dumps(terms)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+    return cached if cached is not None else set()
 
 def apply_exclusion(envelopes):
-    """Filter out envelopes whose Message-ID matches an excluded search term."""
+    """Filter out envelopes whose id (IMAP UID) matches an excluded search term."""
     terms = load_excluded_terms()
     if not terms:
         return envelopes
     excluded = fetch_excluded_msgids(terms)
     if not excluded:
         return envelopes
-    return [e for e in envelopes if (e.get("message-id") or "").strip("<>") not in excluded]
+    return [e for e in envelopes if str(e.get("id") or "") not in excluded]
 
 def get_page_cache_path(page_size, page):
     return os.path.join(CACHE_DIR, f"p_{page_size}_{page}.json")
@@ -237,7 +238,7 @@ def save_page_cache(page_size, page, envelopes):
     except Exception:
         pass
 
-def run_himalaya_safe(cmd, timeout=12.0):
+def run_himalaya_safe(cmd, timeout=8.0):
     with tempfile.NamedTemporaryFile(mode="w+", delete=False, prefix="himalaya_out_") as tmp_out, \
          tempfile.NamedTemporaryFile(mode="w+", delete=False, prefix="himalaya_err_") as tmp_err:
         tmp_out_name = tmp_out.name
@@ -272,7 +273,7 @@ def run_himalaya_safe(cmd, timeout=12.0):
 def fetch_envelopes_direct(page_size, page):
     cmd = ["himalaya", "envelope", "list", "--json", "-s", str(page_size), "-p", str(page)]
     try:
-        out, err, code = run_himalaya_safe(cmd, timeout=12.0)
+        out, err, code = run_himalaya_safe(cmd, timeout=8.0)
         if code == 0 and out:
             data = json.loads(out)
             envelopes = data.get("envelopes", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
@@ -328,6 +329,26 @@ def trigger_prefetch(page_size, target_page):
         pass
 
 def main():
+    if "--resolve-excluded" in sys.argv:
+        idx = sys.argv.index("--resolve-excluded")
+        try:
+            terms = json.loads(sys.argv[idx + 1]) if idx + 1 < len(sys.argv) else []
+        except ValueError:
+            terms = []
+        # Background refresher: self-terminate if IMAP hangs (Gmail trickle), so a
+        # stuck server can never leave an orphaned process behind.
+        threading.Timer(IMAP_OP_TIMEOUT + 5, os._exit, args=(0,)).start()
+        msgids = _resolve_excluded_imap(terms)
+        if msgids:
+            try:
+                tmp = EXCLUDED_MSGID_CACHE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(sorted(msgids), f)
+                os.replace(tmp, EXCLUDED_MSGID_CACHE)
+            except Exception:
+                pass
+        print(json.dumps(sorted(msgids)))
+        return
     if "--get-excluded" in sys.argv:
         print(json.dumps({"terms": load_excluded_terms(), "categories": GMAIL_CATEGORIES}))
         return
@@ -337,6 +358,14 @@ def main():
         save_excluded_terms(terms)
         try: os.unlink(EXCLUDED_MSGID_CACHE)
         except Exception: pass
+        # Kick a background re-resolution so the new exclusion set takes effect
+        # without blocking; the refresher self-terminates on a hung server.
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--resolve-excluded", json.dumps(terms)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
         print(json.dumps({"ok": True}))
         return
 

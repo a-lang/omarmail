@@ -258,7 +258,7 @@ Flickable {
         MouseArea {
           id: rowMouse
           anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
-          anchors.right: actionRow.visible ? actionRow.left : parent.right
+          anchors.right: parent.right
           cursorShape: Qt.PointingHandCursor
           onClicked: p.openDetail(emailRow.env)
         }

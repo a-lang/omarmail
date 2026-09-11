@@ -120,8 +120,8 @@ Panel {
   }
 
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
-      root.bar.centerHoverRevealSuppressed = value
+    if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
   }
 
   // ---- Data Actions
@@ -135,6 +135,10 @@ Panel {
   }
 
   function refresh() {
+    // Skip if a fetch is already in flight: with a hung IMAP server a single
+    // refresh can exceed the 60s timer, and overlapping runs made the refresh
+    // indicator spin almost continuously.
+    if (listProc.running || searchProc.running) return
     errorMsg = ""
     if (searchMode && !gmailSearch && searchQuery !== "") {
       fetchPage(1, true)
@@ -540,6 +544,7 @@ Panel {
     anchorItem: root.anchorItem
     owner: root.barIdentity
     bar: root.bar
+    focusTarget: keyCatcher
     open: root.opened
     centerOnBar: false
     contentWidth: panel.fittedContentWidth(root.panelWidthSetting)
